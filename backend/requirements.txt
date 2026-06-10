@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+anthropic
+httpx
+beautifulsoup4
+python-dotenv
+sherlock-project

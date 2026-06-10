@@ -1,0 +1,10 @@
+backend/venv/
+__pycache__/
+*.pyc
+*.bak*
+backend/face_cache/
+backend/lens_cache/
+.env
+.env.*
+*.v7.*
+*-patched
