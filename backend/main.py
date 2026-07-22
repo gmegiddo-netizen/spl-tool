@@ -971,7 +971,7 @@ async def avatar_tiktok(u: str = ""):
             headers={"User-Agent": _IMG_PROXY_UA, "Referer": "https://www.tiktok.com/"},
             timeout=5.0,
         )
-        if fetched and len(fetched[0]) >= 5000:
+        if fetched and len(fetched[0]) >= 2500:   # audit-F7: was 5000 (rejected real small avatars)
             best = fetched
             break
         if fetched and (best is None or len(fetched[0]) > len(best[0])):
@@ -981,7 +981,7 @@ async def avatar_tiktok(u: str = ""):
         return Response(status_code=502)
     # If all variants returned a ghost-sized image, this is a default-
     # silhouette account — respond 404 so the chip renders as initials.
-    if len(best[0]) < 5000:
+    if len(best[0]) < 2500:   # audit-F7: was 5000
         return Response(status_code=404)
     content, ct = best
     _avatar_cache[cache_key] = (content, ct, _time.time() + _AVATAR_CACHE_TTL)
@@ -1180,6 +1180,11 @@ _HANDLE_ASCII_RE = _ihg_re.compile(r"[^a-z0-9]")
 def _name_variants(name: str, include_longshots: bool = True) -> list[str]:
     parts = [p for p in (name or "").lower().split() if p]
     if len(parts) < 2:
+        # audit-F14 2026-07-06: single-token names previously got no guesses. Emit a
+        # tiny bare-handle set (free existence probes; paid enrich only on a real hit).
+        if len(parts) == 1:
+            _solo = _HANDLE_ASCII_RE.sub("", parts[0])
+            return [_solo, f"real{_solo}", f"{_solo}official"] if len(_solo) >= 3 else []
         return []
     first = _HANDLE_ASCII_RE.sub("", parts[0])
     last  = _HANDLE_ASCII_RE.sub("", parts[-1])
@@ -1409,10 +1414,10 @@ async def _guess_handle_candidates(name: str, existing: list[dict], include_long
     # Miss: "statusCode":10221 (user not found). Substring search on the
     # error-component strings is unreliable — those phrases ship in
     # every page's JS bundle.
-    tt_sem = asyncio.Semaphore(3)
+    tt_sem = asyncio.Semaphore(5)   # audit-F13
     async def _tt_exists(variant: str):
         async with tt_sem:
-            await asyncio.sleep(_hg_random.uniform(0.0, 1.5))
+            await asyncio.sleep(_hg_random.uniform(0.0, 0.4))   # audit-F13: less jitter → more guesses ready by early-drain
             url = f"https://www.tiktok.com/@{variant}"
             try:
                 async with _httpx.AsyncClient(follow_redirects=True,
@@ -1455,10 +1460,10 @@ async def _guess_handle_candidates(name: str, existing: list[dict], include_long
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9",
     }
 
-    ig_sem = asyncio.Semaphore(3)
+    ig_sem = asyncio.Semaphore(5)   # audit-F13
     async def _ig_exists(variant: str):
         async with ig_sem:
-            await asyncio.sleep(_hg_random.uniform(0.0, 1.5))
+            await asyncio.sleep(_hg_random.uniform(0.0, 0.4))   # audit-F13: less jitter → more guesses ready by early-drain
             url = f"https://www.instagram.com/{variant}/"
             try:
                 async with _httpx.AsyncClient(follow_redirects=True,
@@ -1481,10 +1486,10 @@ async def _guess_handle_candidates(name: str, existing: list[dict], include_long
             except Exception:
                 return ("ambig", variant)
 
-    fb_sem = asyncio.Semaphore(3)
+    fb_sem = asyncio.Semaphore(5)   # audit-F13
     async def _fb_exists(variant: str):
         async with fb_sem:
-            await asyncio.sleep(_hg_random.uniform(0.0, 1.5))
+            await asyncio.sleep(_hg_random.uniform(0.0, 0.4))   # audit-F13: less jitter → more guesses ready by early-drain
             url = f"https://www.facebook.com/{variant}"
             try:
                 async with _httpx.AsyncClient(follow_redirects=True,
@@ -1908,7 +1913,9 @@ async def search_profiles_stream(req: SearchRequest):
             return (_json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
 
         # Transliteration (skipped for ASCII names — usually instant)
-        latin_name = transliterate_name(req.name)
+        # audit-F8 2026-07-06: off the event loop — the sync Anthropic call (~0.3-1s
+        # for non-Latin names) otherwise blocks EVERY concurrent request on the worker.
+        latin_name = await asyncio.to_thread(transliterate_name, req.name)
         name_for_verify = (
             f"{req.name} ({latin_name})" if latin_name != req.name else req.name
         )
@@ -2105,7 +2112,11 @@ async def search_profiles_stream(req: SearchRequest):
                 except Exception:
                     return p
             _seed_handles = [h for h in (_handle_from_url(u) for u in known_links.values()) if h]
-            guessed = await _guess_handle_candidates(req.name, [], seed_handles=_seed_handles)
+            # audit-F4 2026-07-06: feed the TRANSLITERATED name — _name_variants strips
+            # non-ASCII to empty, so a raw Hebrew/Arabic name produced ZERO handle
+            # guesses (the SERP-miss safety-net lane was dead for exactly those people).
+            _hg_name = latin_name if (latin_name and latin_name != req.name) else req.name
+            guessed = await _guess_handle_candidates(_hg_name, [], seed_handles=_seed_handles)
             inlined = await asyncio.gather(*[_inline(g) for g in guessed])
             return [g for g in inlined if g is not None]
 
@@ -2144,47 +2155,29 @@ async def search_profiles_stream(req: SearchRequest):
                 for platform, candidates in zip(search_tasks.keys(), results):
                     profiles.extend(candidates)
 
-            # v7.56 SERP Haiku safety net (Part B, ~$0.001): one Haiku call over
-            # the raw SERP results recovers profiles the regex discovery dropped.
-            # Run in a thread (sync Anthropic client) so it overlaps nothing it
-            # shouldn't, with its own 2.5s bound + graceful []-fallback inside.
-            # Merged candidates are source="serp_haiku" and flow through the SAME
-            # per-platform Haiku verify + FP-guard below — they do NOT bypass it.
-            try:
-                _existing_keys = set()
-                for _p in profiles:
-                    _u = (_p.get("username") or "").lstrip("@").lower()
-                    if _u:
-                        _existing_keys.add(f"{(_p.get('platform') or '').lower()}|{_u}")
-                _net_name = (
-                    f"{req.name} {latin_name}" if latin_name != req.name else req.name
-                )
-                _net_new = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        serp_haiku_safety_net,
-                        serp_raw_sink, _net_name, req.description,
-                        _existing_keys, _normalize_profile_url,
-                    ),
-                    timeout=3.0 * TS,
-                )
-                if _net_new:
-                    by_plat_added: dict[str, int] = {}
-                    for _c in _net_new:
-                        by_plat_added[_c["platform"]] = by_plat_added.get(_c["platform"], 0) + 1
-                    profiles.extend(_net_new)
-                    _added_desc = ", ".join(
-                        f"{c['platform']}/@{c['username']}" for c in _net_new
-                    )
-                    logger.info(
-                        f"  [serp_haiku] added {len(_net_new)}: {_added_desc} "
-                        f"(per-platform {by_plat_added})"
-                    )
-                else:
-                    logger.info("  [serp_haiku] added 0 (no new profiles)")
-            except asyncio.TimeoutError:
-                logger.info("  [serp_haiku] timed out — added 0")
-            except Exception as _sn_err:
-                logger.info(f"  [serp_haiku] error — added 0: {_sn_err}")
+            # audit-F5 2026-07-06: the SERP Haiku safety net (recovers regex-dropped
+            # profiles) used to BLOCK up to 3s before serp_done was emitted, delaying
+            # first-chip. Kick it off concurrently, emit serp_done now, and await+merge
+            # its results just before the verify fan-out below — every recovered
+            # candidate still flows through the SAME per-platform verify + FP-guard
+            # (nothing bypasses scoring), but the 3s now overlaps the handle-guess
+            # early drain instead of sitting on the critical path.
+            _sn_existing_keys = set()
+            for _p in profiles:
+                _u = (_p.get("username") or "").lstrip("@").lower()
+                if _u:
+                    _sn_existing_keys.add(f"{(_p.get('platform') or '').lower()}|{_u}")
+            _sn_name = (
+                f"{req.name} {latin_name}" if latin_name != req.name else req.name
+            )
+            _safety_net_task = asyncio.create_task(asyncio.wait_for(
+                asyncio.to_thread(
+                    serp_haiku_safety_net,
+                    serp_raw_sink, _sn_name, req.description,
+                    _sn_existing_keys, _normalize_profile_url,
+                ),
+                timeout=3.0 * TS,
+            ))
 
             yield _emit({"type": "phase", "name": "serp_done",
                          "ts": round(time.time() - start, 2),
@@ -2222,6 +2215,24 @@ async def search_profiles_stream(req: SearchRequest):
                     emitted_hg_urls = set()
             else:
                 emitted_hg_urls = set()
+
+            # audit-F5 2026-07-06: await + merge the safety-net recoveries here, so all
+            # candidates (regex + recovered) are present before the verify fan-out and
+            # the first_ig scan below. This await overlaps the early-hg drain above.
+            try:
+                _sn_new = await _safety_net_task
+                if _sn_new:
+                    _sn_added: dict[str, int] = {}
+                    for _c in _sn_new:
+                        _sn_added[_c["platform"]] = _sn_added.get(_c["platform"], 0) + 1
+                    profiles.extend(_sn_new)
+                    logger.info(f"  [serp_haiku] added {len(_sn_new)} (per-platform {_sn_added})")
+                else:
+                    logger.info("  [serp_haiku] added 0 (no new profiles)")
+            except asyncio.TimeoutError:
+                logger.info("  [serp_haiku] timed out — added 0")
+            except Exception as _sn_err:
+                logger.info(f"  [serp_haiku] error — added 0: {_sn_err}")
 
             # ITER31 2026-05-28: per-platform parallel verify.
             # Old flow: single Haiku call over ALL candidates → ~5s before any profile
@@ -2294,6 +2305,10 @@ async def search_profiles_stream(req: SearchRequest):
                     top, second = survivors[0], survivors[1]
                     if top.get("score", 0) > 85 and second.get("score", 0) < 70:
                         out = [top]
+                    elif len(survivors) >= 3 and survivors[2].get("score", 0) >= 70:
+                        # audit-F10 2026-07-06: surface a strong 3rd (personal+brand,
+                        # main+finsta) — already scored, so no extra API calls.
+                        out = survivors[:3]
                     else:
                         out = [top, second]
 
@@ -2513,7 +2528,12 @@ async def search_profiles_stream(req: SearchRequest):
                             # the ~30KB base64 image_data UNLESS the chip has no
                             # image_url to render from (then it's the only source).
                             _avp = {"phash_b64": after[1], "face_emb_b64": after[2]}
-                            if not (prof.get("image_url") or ""):
+                            # audit-F3 2026-07-06: always ship the already-fetched
+                            # base64 (not only when image_url is absent). The browser's
+                            # own second fetch of /api/avatar can 404/502 independently
+                            # (rate-limit, ghost gate, cross-worker cache miss); painting
+                            # the known-good bytes we already hold kills most blank cards.
+                            if after[0]:
                                 _avp["image_data"] = after[0]
                             _patches["avatar"] = _avp
 
@@ -2711,9 +2731,12 @@ async def search_profiles_stream(req: SearchRequest):
             # double-emit. Wrapped so a hiccup can never abort the stream.
             if _enrich_tasks:
                 try:
+                    _drain_deadline = time.time() + 6.0 * TS   # audit-F9: bound the enrich tail
                     for _et in asyncio.as_completed(_enrich_tasks):
+                        if time.time() > _drain_deadline:
+                            break   # stragglers keep running; their patches ride the *_update channel
                         try:
-                            await _et
+                            await asyncio.wait_for(_et, timeout=max(0.2, _drain_deadline - time.time()))
                         except Exception:
                             pass
                         for _pe in _drain_patch_events():
@@ -2742,7 +2765,7 @@ async def search_profiles_stream(req: SearchRequest):
                 # 2026-05-31: skip the await entirely when no IG SERP hit
                 # (ig_task is None — see CHANGE 1 above).
                 if ig_task is not None:
-                    await asyncio.wait_for(ig_task, timeout=11.0 * TS)
+                    await asyncio.wait_for(ig_task, timeout=4.0 * TS)   # audit-F9: bounded tail (was 11s); upgrade rides avatar_update
             except asyncio.TimeoutError:
                 pass
             if ig_already_emitted and first_ig and first_ig.get("source") == "brightdata":

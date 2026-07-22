@@ -98,6 +98,13 @@ def _fp_guard(profile: dict, name: str) -> tuple[int | None, str | None]:
         # Exception: explicitly accept user-provided URLs
         if profile.get("source") == "user_provided":
             return (None, None)
+        # audit-R5 2026-07-06: in the streaming path a real foreign-script account
+        # often reaches this guard BEFORE enrichment, with an empty or non-Latin
+        # display_name and a name-derived-but-unrelated-looking handle — the 35 cap
+        # then scores it out before the user ever sees it. Treat empty/non-Latin
+        # display_name as neutral (50) so it survives to the carousel to be judged.
+        if not dn or not any('a' <= c <= 'z' for c in dn.lower()):
+            return (50, "FP guard: name absent but display_name empty/non-Latin — neutral")
         return (35, "FP guard: name absent from both username and display_name")
 
     # GUARD 2: display name looks like a news headline
@@ -209,7 +216,7 @@ def _verify_with_haiku(profiles: list[dict], name: str, description: str) -> lis
     prompt = f"""Score each profile 0-100 for whether it belongs to: {name} ({description}).
 
 Rules:
-- Profession contradiction (description says "lawyer", bio says "CFO") → score 10-25
+- Clear profession CONFLICT (plainly different field, e.g. lawyer vs pro athlete) → 30-45; related/adjacent roles (lawyer↔general counsel, journalist↔author, CEO↔founder) → NO penalty
 - Name matches + bio aligns with description → 90+
 - Name matches + bio consistent (no contradiction) → 70-89
 - Name matches + thin/empty bio → 50
