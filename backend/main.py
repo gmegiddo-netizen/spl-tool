@@ -640,6 +640,21 @@ _IMG_HOST_ALLOWLIST = (
 import time as _time
 _avatar_cache: dict = {}  # key -> (content_bytes, content_type, expires_at_ts)
 _AVATAR_CACHE_TTL = 3600
+# 2026-07-22: negative cache for definitive avatar MISSES (404s). Without it
+# the frontend's fallback chain + its delayed retry re-ran the full SC lookup
+# (and LinkedIn's Scraping-Browser render) for the same pictureless profile —
+# ~6 paid calls per hard miss in one run. Transient 502s are NOT neg-cached.
+_AVATAR_NEG_TTL = 600
+
+
+def _avatar_neg_hit(cache_key) -> bool:
+    e = _avatar_cache.get("neg:" + cache_key)
+    return bool(e and e[2] > _time.time())
+
+
+def _avatar_miss(cache_key):
+    _avatar_cache["neg:" + cache_key] = (b"", "", _time.time() + _AVATAR_NEG_TTL)
+    return Response(status_code=404)
 
 
 # v7.66 MONEY-LEAK FIX: defensive handle normalizer. A few upstream paths
@@ -842,6 +857,8 @@ async def avatar_x(u: str = ""):
     if cached and cached[2] > _time.time():
         return Response(content=cached[0], media_type=cached[1],
                         headers={"Cache-Control": "public, max-age=3600"})
+    if _avatar_neg_hit(cache_key):
+        return Response(status_code=404)
 
     import re as _re
     page = await _fetch_bytes(
@@ -854,7 +871,7 @@ async def avatar_x(u: str = ""):
     body, _ = page
     m = _re.search(rb'pbs\.twimg\.com/profile_images/[^"]+', body)
     if not m:
-        return Response(status_code=404)
+        return _avatar_miss(cache_key)
     avatar_url = "https://" + m.group(0).decode("utf-8", errors="ignore").split('"')[0].split("'")[0]
     # Upgrade _normal (48x48) → _400x400. Same path & query; only the size token differs.
     avatar_url = _re.sub(r"_(normal|bigger|mini)(?=\.[a-z]+(\?|$))", "_400x400", avatar_url)
@@ -885,6 +902,8 @@ async def avatar_instagram(u: str = ""):
     if cached and cached[2] > _time.time():
         return Response(content=cached[0], media_type=cached[1],
                         headers={"Cache-Control": "public, max-age=3600"})
+    if _avatar_neg_hit(cache_key):
+        return Response(status_code=404)
 
     import httpx as _httpx
     from profile_finder import SCRAPECREATORS_API_KEY
@@ -902,7 +921,7 @@ async def avatar_instagram(u: str = ""):
         user = ((data.get("data") or {}).get("user") or {})
         avatar_url = user.get("profile_pic_url_hd") or user.get("profile_pic_url")
         if not avatar_url:
-            return Response(status_code=404)
+            return _avatar_miss(cache_key)
     except Exception:
         return Response(status_code=502)
 
@@ -938,6 +957,8 @@ async def avatar_tiktok(u: str = ""):
     if cached and cached[2] > _time.time():
         return Response(content=cached[0], media_type=cached[1],
                         headers={"Cache-Control": "public, max-age=3600"})
+    if _avatar_neg_hit(cache_key):
+        return Response(status_code=404)
 
     import httpx as _httpx
     from profile_finder import SCRAPECREATORS_API_KEY
@@ -958,7 +979,7 @@ async def avatar_tiktok(u: str = ""):
         candidates = [user.get("avatarLarger"), user.get("avatarMedium"), user.get("avatarThumb")]
         candidates = [c for c in candidates if c]
         if not candidates:
-            return Response(status_code=404)
+            return _avatar_miss(cache_key)
     except Exception:
         return Response(status_code=502)
 
@@ -982,7 +1003,7 @@ async def avatar_tiktok(u: str = ""):
     # If all variants returned a ghost-sized image, this is a default-
     # silhouette account — respond 404 so the chip renders as initials.
     if len(best[0]) < 2500:   # audit-F7: was 5000
-        return Response(status_code=404)
+        return _avatar_miss(cache_key)
     content, ct = best
     _avatar_cache[cache_key] = (content, ct, _time.time() + _AVATAR_CACHE_TTL)
     return Response(content=content, media_type=ct,
@@ -1005,6 +1026,8 @@ async def avatar_facebook(u: str = ""):
     if cached and cached[2] > _time.time():
         return Response(content=cached[0], media_type=cached[1],
                         headers={"Cache-Control": "public, max-age=3600"})
+    if _avatar_neg_hit(cache_key):
+        return Response(status_code=404)
 
     import httpx as _httpx
     from profile_finder import SCRAPECREATORS_API_KEY
@@ -1021,14 +1044,14 @@ async def avatar_facebook(u: str = ""):
             return Response(status_code=502)
         data = r.json()
         if not data.get("success"):
-            return Response(status_code=404)
+            return _avatar_miss(cache_key)
         avatar_url = (
             data.get("profilePicLarge")
             or data.get("profilePicMedium")
             or data.get("profilePicSmall")
         )
         if not avatar_url:
-            return Response(status_code=404)
+            return _avatar_miss(cache_key)
     except Exception:
         return Response(status_code=502)
 
@@ -1059,6 +1082,8 @@ async def avatar_linkedin(u: str = ""):
     if cached and cached[2] > _time.time():
         return Response(content=cached[0], media_type=cached[1],
                         headers={"Cache-Control": "public, max-age=3600"})
+    if _avatar_neg_hit(cache_key):
+        return Response(status_code=404)
 
     import httpx as _httpx
     from profile_finder import SCRAPECREATORS_API_KEY
@@ -1072,7 +1097,18 @@ async def avatar_linkedin(u: str = ""):
         # never 500. Cost is logged via _log_spl_bd_usage inside the helper.
         try:
             from profile_finder import scraping_browser_linkedin_avatar
-            bd_url = await scraping_browser_linkedin_avatar(u)
+            # 2026-07-22: the shared Scraping-Browser session occasionally dies
+            # mid-fetch ("Target page, context or browser has been closed") —
+            # one fresh attempt usually succeeds (observed benjamin-i-birely
+            # failing repeatedly while the next handle rendered fine).
+            bd_url = None
+            for _sb_attempt in (1, 2):
+                try:
+                    bd_url = await scraping_browser_linkedin_avatar(u)
+                except Exception:
+                    bd_url = None
+                if bd_url:
+                    break
             if not bd_url:
                 return None
             bd_fetched = await _fetch_bytes(
@@ -1130,7 +1166,36 @@ async def avatar_linkedin(u: str = ""):
     bd_resp = await _bd_scraping_browser_fallback()
     if bd_resp is not None:
         return bd_resp
-    return Response(status_code=404)
+    return _avatar_miss(cache_key)
+
+
+@app.get("/api/enrich-one")
+async def enrich_one(platform: str = "", handle: str = "", url: str = ""):
+    """MISSING-ONLY backfill for ONE final-results card. The frontend calls this
+    only for cards actually missing a follower count (it handles a missing picture
+    itself by pointing the <img> at /api/avatar/*). Returns {"followers": "..."}.
+    Time-boxed so a slow LinkedIn lookup can never hang the card. Reuses the same
+    cached _fetch_followers path as the live stream, so a repeat is a cache hit."""
+    out = {"followers": ""}
+    h = (handle or "").strip()
+    if not h and url:
+        try:
+            h = _handle_from_url(url)
+        except Exception:
+            h = ""
+    try:
+        h = _normalize_handle_param(h or "")
+    except Exception:
+        pass
+    if not platform or not h:
+        return out
+    try:
+        _to = 9.0 if platform == "LinkedIn" else 12.0
+        fc = await asyncio.wait_for(_fetch_followers(platform, h), timeout=_to)
+        out["followers"] = fc or ""
+    except Exception:
+        pass
+    return out
 
 
 @app.get("/api/img-proxy")
@@ -2876,10 +2941,15 @@ def normalize_profile_url(raw):
         return m2.group(1) if m2 else None
 
     # ── Identify platform from host ──
+    # Opaque short-link hosts carry a share code, not a username — refuse
+    # here ("don't fabricate"); link_needs_resolution()/resolve_opaque_link()
+    # follow their redirects upstream and re-normalize the landing URL.
+    if host in ("vm.tiktok.com", "vt.tiktok.com", "fb.me", "lnkd.in", "t.co"):
+        return None
     # Map every known host alias to a canonical platform key.
     h = host
     # Facebook family
-    if (h in ("fb.com", "fb.me") or h.endswith(".fb.com") or
+    if (h == "fb.com" or h.endswith(".fb.com") or
             h == "facebook.com" or h.endswith(".facebook.com")):
         platform = "Facebook"
     elif h == "instagram.com" or h.endswith(".instagram.com"):
@@ -2970,9 +3040,24 @@ def normalize_profile_url(raw):
                         "canonical_url": f"{CANON}/i/user/{im.group(1)}",
                         "identifier": im.group(1)}
             return None
+        # /intent/follow?screen_name=<handle> carries the handle directly;
+        # /intent/user?user_id=<digits> gives the numeric form (resolved
+        # downstream like /i/user/). Other intents are not profiles.
+        if first == "intent":
+            sn = qd.get("screen_name", "")
+            if sn and _re.match(r"^[A-Za-z0-9_]+$", sn):
+                return {"platform": "X",
+                        "canonical_url": f"{CANON}/{sn}",
+                        "identifier": sn}
+            uid = _digits(qd.get("user_id", ""))
+            if uid:
+                return {"platform": "X",
+                        "canonical_url": f"{CANON}/i/user/{uid}",
+                        "identifier": uid}
+            return None
         # Reserved non-profile first segments.
         if first in ("home", "explore", "search", "settings", "messages",
-                     "notifications", "compose", "hashtag", "intent",
+                     "notifications", "compose", "hashtag",
                      "share", "login", "signup", "tos", "privacy", "about"):
             return None
         handle = segs[0].lstrip("@")
@@ -3048,6 +3133,91 @@ def _normalize_profile_url(raw: str) -> str:
     return res["canonical_url"]
 
 
+# ── Link-syntax ease (2026-07-22) ────────────────────────────────────────
+# Mobile "Share profile → Copy link" produces OPAQUE short links with no
+# username in them (TikTok vm./vt./t/ codes, facebook.com/share/<code>,
+# fb.me, lnkd.in, t.co, x.com/i/user/<numeric>). These must be redirect-
+# resolved server-side before normalize_profile_url can read them.
+
+def link_needs_resolution(raw):
+    """Return a fetchable URL when `raw` is an opaque share link whose
+    redirect chain must be followed to learn the profile; else None."""
+    import re as _re
+    if not raw or not isinstance(raw, str):
+        return None
+    u = raw.strip()
+    if not _re.match(r"^https?://", u, _re.IGNORECASE):
+        if "." not in u.split("/")[0]:
+            return None
+        u = "https://" + u
+    m = _re.match(r"^https?://([^/?#]+)([^?#]*)", u, _re.IGNORECASE)
+    if not m:
+        return None
+    h = m.group(1).lower()
+    path = (m.group(2) or "").lower()
+    if h in ("vm.tiktok.com", "vt.tiktok.com", "fb.me", "lnkd.in", "t.co"):
+        return u
+    if (h == "tiktok.com" or h.endswith(".tiktok.com")) and path.startswith("/t/"):
+        return u
+    if ((h in ("facebook.com", "fb.com") or h.endswith(".facebook.com")
+         or h.endswith(".fb.com")) and path.startswith("/share")):
+        return u
+    if ((h in ("x.com", "twitter.com") or h.endswith(".x.com")
+         or h.endswith(".twitter.com")) and _re.match(r"^/i/user/\d+", path)):
+        return u
+    return None
+
+
+async def resolve_opaque_link(url, timeout_s=6.0):
+    """Follow an opaque link's redirect chain with a mobile browser UA and
+    return the final URL, or None. Login/auth walls that stash the real
+    target in a query param (FB next=, LinkedIn sessionRedirect=) are
+    unwrapped. GET, not HEAD — several of these hosts refuse HEAD."""
+    import re as _re
+    from urllib.parse import unquote
+    _UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+           "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 "
+           "Mobile/15E148 Safari/604.1")
+    try:
+        async with _pooled() as cl:
+            r = await cl.get(url, timeout=timeout_s, follow_redirects=True,
+                             headers={"User-Agent": _UA, "Accept-Language": "en"})
+        final = str(r.url)
+    except Exception:
+        return None
+    if not final:
+        return None
+    low = final.lower()
+    if "login" in low or "authwall" in low:
+        fm = _re.search(r"[?&](?:next|url|sessionredirect)=([^&]+)", final,
+                        _re.IGNORECASE)
+        if fm:
+            return unquote(fm.group(1))
+    return final
+
+
+def link_failure_message(raw):
+    """Customer-facing message for an unusable link — specific enough that
+    the user's NEXT paste succeeds (plain language, no jargon)."""
+    import re as _re
+    low = (raw or "").strip().lower()
+    if _re.search(r"instagram\.com/(p|reel|reels|tv|stories)/", low):
+        return ("That's a link to a post, not a profile. In the Instagram app: "
+                "open their profile, tap ⋯, then Share this profile.")
+    if _re.search(r"(facebook|fb)\.com/(groups|watch|events|marketplace)", low):
+        return ("That link isn't a personal profile. Please paste the link to "
+                "their profile page.")
+    if "linkedin.com/company" in low or "linkedin.com/school" in low:
+        return ("That's a company page. Please paste their personal profile "
+                "link (it looks like linkedin.com/in/their-name).")
+    _bare = low.split("://", 1)[-1]
+    if low and "://" not in low and "." not in _bare.split("/")[0].lstrip("@"):
+        return ("That looks like a username, not a link. Pick their platform "
+                "below, or paste the full profile address.")
+    return ("We couldn't recognize that link. Paste a profile link from X, "
+            "Instagram, TikTok, Facebook, or LinkedIn.")
+
+
 @app.post("/api/verify-url")
 async def verify_url(req: VerifyUrlRequest):
     """Verify a profile URL exists. Customer-facing errors only —
@@ -3102,9 +3272,27 @@ async def verify_url(req: VerifyUrlRequest):
             return prof
         return prof
 
-    url = _normalize_profile_url(req.url)
+    # Link-syntax ease (2026-07-22): opaque app share links (vm./vt.tiktok.com,
+    # tiktok.com/t/, facebook.com/share/..., fb.me, lnkd.in, t.co, x.com/i/user/<id>)
+    # carry no username — follow their redirect chain first, then normalize the
+    # landing URL. Mobile "Share profile -> Copy link" produces exactly these.
+    _raw_in = req.url or ""
+    _opq = link_needs_resolution(_raw_in)
+    if _opq:
+        _final = await resolve_opaque_link(_opq)
+        if not _final:
+            return {"valid": False, "error":
+                    "We couldn't open that share link. Please open the profile "
+                    "in your browser and paste its address instead."}
+        _raw_in = _final
+    url = _normalize_profile_url(_raw_in)
+    # X numeric-id canonical (/i/user/<id>) has no handle — resolve it too.
+    if url and "/i/user/" in url:
+        _final = await resolve_opaque_link(url)
+        _u2 = _normalize_profile_url(_final) if _final else ""
+        url = _u2 if (_u2 and "/i/user/" not in _u2) else ""
     if not url:
-        return {"valid": False, "error": "Please paste a full profile link (https://...)."}
+        return {"valid": False, "error": link_failure_message(req.url)}
 
     # Detect platform + extract username from the canonical URL.
     # LinkedIn allows letters/digits/dash/underscore/dot in the vanity.
@@ -3268,6 +3456,24 @@ async def verify_url(req: VerifyUrlRequest):
         _fb_fc = data.get("followerCount") or data.get("likeCount")
         if _fb_fc:
             followers = str(_fb_fc)
+        # 2026-07-22: this SC response already carries the pic fields the FB
+        # avatar endpoint would re-buy — pre-seed the avatar cache so the
+        # endpoint (inline + browser fallback chain) hits it for free.
+        _fb_pic = (data.get("profilePicLarge") or data.get("profilePicMedium")
+                   or data.get("profilePicSmall"))
+        if _fb_pic:
+            try:
+                _pf = await _fetch_bytes(
+                    _fb_pic,
+                    headers={"User-Agent": _IMG_PROXY_UA,
+                             "Referer": "https://www.facebook.com/"},
+                    timeout=6.0,
+                )
+                if _pf and len(_pf[0]) > 2000:
+                    _avatar_cache[f"fb:{username.lower()}"] = (
+                        _pf[0], _pf[1], _time.time() + _AVATAR_CACHE_TTL)
+            except Exception:
+                pass
 
     elif platform == "Instagram":
         user = ((data.get("data") or {}).get("user") or {})
